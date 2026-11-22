@@ -1,4 +1,4 @@
-name: Sync public CSV
+name: Sync complete ARK public AI dataset
 on:
   push:
     branches: [main]
@@ -17,53 +17,88 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch and validate the published rules
+      - name: Download and validate every published record
+        id: validate
+        continue-on-error: true
         env:
           SOURCE_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRUzNOgE9JkyvwI6MIumor_UUMBabbimxK9dPma3HmcfC2RFyqecGBFtbzLqQgWGc85Za4WK9J8NUgc/pub?gid=1010&single=true&output=csv'
         run: |
           source_file=$(mktemp)
           trap 'rm -f "$source_file"' EXIT
-          curl --fail --silent --show-error --location --retry 2 --max-time 30 --max-filesize 2097152 "$SOURCE_URL" -o "$source_file"
+          curl --fail --silent --show-error --location --retry 2 --max-time 45 --max-filesize 2097152 "$SOURCE_URL" -o "$source_file"
           python3 - "$source_file" <<'PY'
           import csv
+          import hashlib
+          import io
           import sys
-          from datetime import datetime, timezone
+          from collections import Counter
           from pathlib import Path
 
-          with open(sys.argv[1], encoding='utf-8-sig', newline='') as source:
-              reader = csv.reader(source, strict=True)
-              header = next(reader, [])
-              for column in ('種別', 'レースID'):
-                  if header.count(column) != 1:
-                      raise SystemExit(f'Missing or duplicate column: {column}')
-              kind = header.index('種別')
-              race_id = header.index('レースID')
-              rules = []
-              for row in reader:
-                  if not any(row):
-                      continue
-                  if len(row) != len(header):
-                      raise SystemExit('CSV row width differs from the header')
-                  if row[kind].strip() == '運用ルール' and row[race_id].strip() == 'ARK-RULES-V08':
-                      rules.append(row)
+          source = Path(sys.argv[1]).read_bytes()
+          reader = csv.reader(io.StringIO(source.decode('utf-8-sig'), newline=''), strict=True)
+          header = next(reader, [])
+          expected = ('種別', 'レースID', '対象日/年', '馬番', '馬名', '情報基準日')
+          if len(header) != 70 or len(set(header)) != 70 or not set(expected) <= set(header):
+              raise SystemExit('Unexpected schema: expected 70 distinct columns')
+          rows = [row for row in reader if any(row)]
+          if any(len(row) != len(header) for row in rows):
+              raise SystemExit('Malformed record width')
 
-          if len(rules) != 17 or len({tuple(row) for row in rules}) != 17:
-              raise SystemExit(f'Expected 17 distinct public rules, got {len(rules)} rows')
+          kind, race, name = map(header.index, ('種別', 'レースID', '馬名'))
+          counts = Counter(row[kind] for row in rows)
+          baseline = {'レース概要': 1, '出走馬': 18, '過去結果': 5, '過去10年統計': 22,
+                      '検証ルール': 9, '歴代優勝馬': 42, '歴代入着馬': 126,
+                      '20年人気別統計': 18, '42年勝馬傾向': 33, '運用ルール': 17}
+          if any(counts[key] < minimum for key, minimum in baseline.items()):
+              raise SystemExit(f'Published data below verified coverage: {dict(counts)}')
+          rules = [row for row in rows if row[kind] == '運用ルール' and row[race] == 'ARK-RULES-V08']
+          rule_ids = {row[name].split('｜', 1)[0] for row in rules}
+          if len(rules) != 17 or rule_ids != {f'R{i:02d}' for i in range(1, 18)}:
+              raise SystemExit('Expected all 17 distinct operational rules')
 
+          Path('ark-public-data.csv').write_bytes(source)
           with open('ark-rules-v08.csv', 'w', encoding='utf-8', newline='') as output:
               writer = csv.writer(output, lineterminator='\n')
               writer.writerow(header)
               writer.writerows(rules)
-          # A monthly status commit keeps scheduled public workflows active.
-          month = datetime.now(timezone.utc).strftime('%Y-%m')
-          Path('last-successful-month.txt').write_text(month + '\n', encoding='utf-8')
-          print('Validated 17 public rules')
+          print(f'Published source: {len(rows)} records, {len(header)} columns, {len(rules)} operational rules')
+          print(f'Source and full CSV SHA-256: {hashlib.sha256(source).hexdigest()}')
+          print(dict(counts))
           PY
-      - name: Commit the validated CSV
+      - name: Publish sync status and validated files
+        env:
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
         run: |
-          git add -- ark-rules-v08.csv last-successful-month.txt
-          if git diff --cached --quiet; then
-            exit 0
+          if [ "$VALIDATION_OUTCOME" = success ]; then
+            date -u +%Y-%m > last-successful-month.txt
+          else
+            git restore --worktree -- ark-rules-v08.csv
+            if git ls-files --error-unmatch ark-public-data.csv >/dev/null 2>&1; then
+              git restore --worktree -- ark-public-data.csv
+            else
+              rm -f ark-public-data.csv
+            fi
           fi
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Sync public ARK rules'
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          csv_path = Path('ark-public-data.csv')
+          status = {
+              'status': os.environ['VALIDATION_OUTCOME'],
+              'checked_at_utc': datetime.now(timezone.utc).isoformat(),
+              'published_csv_sha256': hashlib.sha256(csv_path.read_bytes()).hexdigest() if csv_path.exists() else None,
+              'actions_run': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          Path('sync-status.json').write_text(json.dumps(status, indent=2) + '\n', encoding='utf-8')
+          PY
+          git add -- sync-status.json
+          if [ "$VALIDATION_OUTCOME" = success ]; then
+            git add -- ark-public-data.csv ark-rules-v08.csv last-successful-month.txt
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Public CSV sync: $VALIDATION_OUTCOME"
           git push origin HEAD:main
+          test "$VALIDATION_OUTCOME" = success
