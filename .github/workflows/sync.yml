@@ -1,0 +1,69 @@
+name: Sync public CSV
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/sync.yml']
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: public-csv-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and validate the published rules
+        env:
+          SOURCE_URL: 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRUzNOgE9JkyvwI6MIumor_UUMBabbimxK9dPma3HmcfC2RFyqecGBFtbzLqQgWGc85Za4WK9J8NUgc/pub?gid=1010&single=true&output=csv'
+        run: |
+          source_file=$(mktemp)
+          trap 'rm -f "$source_file"' EXIT
+          curl --fail --silent --show-error --location --retry 2 --max-time 30 --max-filesize 2097152 "$SOURCE_URL" -o "$source_file"
+          python3 - "$source_file" <<'PY'
+          import csv
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          with open(sys.argv[1], encoding='utf-8-sig', newline='') as source:
+              reader = csv.reader(source, strict=True)
+              header = next(reader, [])
+              for column in ('種別', 'レースID'):
+                  if header.count(column) != 1:
+                      raise SystemExit(f'Missing or duplicate column: {column}')
+              kind = header.index('種別')
+              race_id = header.index('レースID')
+              rules = []
+              for row in reader:
+                  if not any(row):
+                      continue
+                  if len(row) != len(header):
+                      raise SystemExit('CSV row width differs from the header')
+                  if row[kind].strip() == '運用ルール' and row[race_id].strip() == 'ARK-RULES-V08':
+                      rules.append(row)
+
+          if len(rules) != 17 or len({tuple(row) for row in rules}) != 17:
+              raise SystemExit(f'Expected 17 distinct public rules, got {len(rules)} rows')
+
+          with open('ark-rules-v08.csv', 'w', encoding='utf-8', newline='') as output:
+              writer = csv.writer(output, lineterminator='\n')
+              writer.writerow(header)
+              writer.writerows(rules)
+          # A monthly status commit keeps scheduled public workflows active.
+          month = datetime.now(timezone.utc).strftime('%Y-%m')
+          Path('last-successful-month.txt').write_text(month + '\n', encoding='utf-8')
+          print('Validated 17 public rules')
+          PY
+      - name: Commit the validated CSV
+        run: |
+          git add -- ark-rules-v08.csv last-successful-month.txt
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Sync public ARK rules'
+          git push origin HEAD:main
