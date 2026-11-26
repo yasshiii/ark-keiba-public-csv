@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "checked_at_utc": "2026-11-26T00:37:52.058285+00:00",
+  "checked_at_utc": "2026-11-26T08:52:48.548113+00:00",
   "tables": {
     "ark-local-results.csv": {
       "gid": 8101,
       "columns": 46,
-      "records": 0
+      "records": 47
     },
     "ark-local-training.csv": {
       "gid": 8102,
@@ -15,12 +15,12 @@
     "ark-local-market.csv": {
       "gid": 8103,
       "columns": 17,
-      "records": 0
+      "records": 65
     },
     "ark-local-stable-jockey.csv": {
       "gid": 8104,
       "columns": 28,
-      "records": 0
+      "records": 14
     }
   }
 }
